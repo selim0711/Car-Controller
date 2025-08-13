@@ -1,5 +1,0 @@
-
-
-
-
-## "npm start" zum Testen 
