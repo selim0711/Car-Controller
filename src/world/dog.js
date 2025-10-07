@@ -1,3 +1,4 @@
+// src/world/dog.js
 import * as THREE from 'three'
 import * as CANNON from 'cannon-es'
 import { preloader } from '@/utils/preloader'
@@ -7,11 +8,12 @@ export default class Dog {
     this.scene = scene
     this.world = world
 
-    this.model = null
+    this.model = null               // Pivot (folgt der Physik)
     this.body = null
     this.mass = 20
-
-    // Steuerungszustand
+this._jumpSlowStart = 0.6   // ab 70 % der Clipdauer langsamer
+this._jumpSlowFactor = 0.1  // dann nur noch 40 % der normalen Geschwindigkeit
+    // Steuerung/Physik
     this._input = { steer: 0, throttle: 0, brake: 0 }
     this.maxSpeed = 6
     this.accel = 2
@@ -20,24 +22,32 @@ export default class Dog {
     this.frictionLin = 0.12
     this.frictionAng = 0.7
 
-    // Jump / Ground
-    this.jumpSpeed = 5.5               // Ziel-Absprunggeschwindigkeit in m/s
-    this._radius = 0.05                // sehr kleiner Collider
+    // Jump/Ground
+    this.jumpSpeed = 5.5
+    this._radius = 0.05
     this._groundOffset = 0.05
 
-    // Boden-Logik (stabil)
     this._isGrounded = false
     this._rayResult = new CANNON.RaycastResult()
-    this._rayDownExtra = 0.16          // wie weit unter den Fuß strahlen (darf etwas größer sein)
-    this._slopeMaxCos  = Math.cos(55 * Math.PI / 180) // bis ca. 55° als Boden
-    this._groundTol    = 0.03          // Toleranz nahe am Boden
+    this._rayDownExtra = 0.16
+    this._slopeMaxCos  = Math.cos(55 * Math.PI / 180)
+    this._groundTol    = 0.03
 
-    // Anti-Doppelsprung / Feel
     this._lastGroundTime = 0
     this._lastJumpTime   = 0
-    this._coyoteMs       = 120         // so lange nach Bodenkontakt darf noch gesprungen werden
-    this._jumpCooldownMs = 180         // so oft max. springen
-    this._maxVyAfterJump = 7.0         // Sicherheitskappe für vertikale Geschwindigkeit
+    this._coyoteMs       = 120
+    this._jumpCooldownMs = 180
+    this._maxVyAfterJump = 7.0
+
+    // Animation
+    this.mixer = null
+    this._a = { idle: null, walk: null, jump: null } // THREE.AnimationAction(s)
+    this._jumpActive = false
+    this._wasGrounded = false
+
+    // Locomotion-Blend Tuning
+    this._walkThreshold = 0.04                 // ab dieser speed beginnt Walk einzublenden
+    this._walkMaxSpeedFor1 = this.maxSpeed * 0.6 // hier ist Walk ≈ 1.0
   }
 
   async init() {
@@ -49,15 +59,135 @@ export default class Dog {
 
   setDt(dt) { this._dt = dt }
 
-  async loadModel() {
-    const gltf = await preloader.loadGLTF('manni', 'Manni.gltf')
-    this.model = gltf.scene.clone(true)
-    this.model.scale.set(0.1, 0.1, 0.1)
-    this.model.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true } })
-    // this.model.rotation.y = Math.PI
-    this.scene.add(this.model)
+  // WICHTIG: im Renderloop aufrufen (damit der Mixer tickt)
+  update(dt = 1/60) {
+    if (this.mixer) this.mixer.update(dt)
+    this._updateAnimLogic(dt)
   }
 
+  // ----------------------------------------
+  // Load model + setup animations
+  // ----------------------------------------
+  async loadModel() {
+    const gltf = await preloader.loadGLTF('manni', 'Manni.gltf')
+
+    // Pivot folgt später der Physik
+    const pivot = new THREE.Group()
+    pivot.name = 'PLAYER_MANNI'
+    pivot.scale.set(1, 1, 1)
+
+    // Visual (GLTF scene) → 180° Flip NUR am Visual (nicht am Pivot!)
+    const visual = gltf.scene
+    visual.traverse(o => {
+      if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; o.frustumCulled = false }
+    })
+    visual.rotation.y = Math.PI
+    pivot.add(visual)
+
+    this.model = pivot
+    this.scene.add(this.model)
+
+    // Animationen
+    this.mixer = new THREE.AnimationMixer(this.model)
+
+    const clips = gltf.animations || []
+    const pick = (hints) => {
+      const L = hints.map(s => s.toLowerCase())
+      return clips.find(c => L.some(h => (c.name || '').toLowerCase().includes(h))) || null
+    }
+
+    const walkClip = pick(['walk','walking'])
+    const idleClip = pick(['idle','stand'])
+    const jumpClip = pick(['jump','jumping'])
+
+    if (idleClip) this._a.idle = this.mixer.clipAction(idleClip)
+    if (walkClip) this._a.walk = this.mixer.clipAction(walkClip)
+    if (jumpClip) this._a.jump = this.mixer.clipAction(jumpClip)
+
+    // Locomotion immer laufen lassen – Gewichte steuern wir per speed
+    if (this._a.idle) {
+      this._a.idle.setLoop(THREE.LoopRepeat, Infinity)
+      this._a.idle.reset().play()
+      this._a.idle.enabled = true
+      this._a.idle.weight = 1 // Start: nur Idle sichtbar
+    }
+    if (this._a.walk) {
+      this._a.walk.setLoop(THREE.LoopRepeat, Infinity)
+      this._a.walk.reset().play()
+      this._a.walk.enabled = true
+      this._a.walk.weight = 0 // Start: Walk unsichtbar
+    }
+
+    // Jump läuft als OneShot „drüber“ (Gewicht 0 bis aktiv)
+    if (this._a.jump) {
+      this._a.jump.setLoop(THREE.LoopOnce, 1)
+      this._a.jump.clampWhenFinished = true
+      this._a.jump.reset().play()
+      this._a.jump.enabled = true
+      this._a.jump.weight = 0
+    }
+
+    this._jumpActive = false
+  }
+
+  _updateAnimLogic() {
+    if (!this.body || !this._a) return
+
+    const grounded = this.grounded
+    const v = this.body.velocity
+    const speed = Math.hypot(v.x, v.z)
+
+    // Walk-Tempo an reale Geschwindigkeit koppeln (fühlt sich natürlicher an)
+    if (this._a.walk) {
+      const t = THREE.MathUtils.clamp(speed / (this.maxSpeed * 0.6), 0.7, 15)
+      this._a.walk.timeScale = t
+    }
+
+    // Locomotion-Blend (Idle ↔ Walk), solange kein aktiver Jump
+    if (!this._jumpActive) {
+      const k = THREE.MathUtils.clamp(
+        (speed - this._walkThreshold) /
+        Math.max(0.0001, (this._walkMaxSpeedFor1 - this._walkThreshold)),
+        0, 1
+      )
+      if (this._a.walk) this._a.walk.weight = k
+      if (this._a.idle) this._a.idle.weight = 1 - k
+    }
+
+if (this._jumpActive && this._a.jump) {
+  const J = this._a.jump
+  const dur = J.getClip()?.duration ?? 0
+  const t   = J.time
+
+  // --- Dynamik: ab 70 % der Zeit langsamer abspielen ---
+  if (dur > 0) {
+    const frac = t / dur
+    if (frac >= this._jumpSlowStart) {
+      J.timeScale = this._jumpSlowFactor
+    } else {
+      J.timeScale = 1.0
+    }
+  }
+
+  const nearEnd = t >= Math.max(0, dur - 0.05)
+  const landed  = this.grounded && !this._wasGrounded
+
+  if (landed || nearEnd) {
+    J.weight = 0
+    this._jumpActive = false
+  } else {
+    if (this._a.walk) this._a.walk.weight = 0
+    if (this._a.idle) this._a.idle.weight = 0
+    J.weight = 1
+  }
+}
+
+    this._wasGrounded = grounded
+  }
+
+  // ----------------------------------------
+  // Physics
+  // ----------------------------------------
   createBody() {
     const shape = new CANNON.Sphere(this._radius)
     this.body = new CANNON.Body({
@@ -79,23 +209,16 @@ export default class Dog {
       this.body.quaternion.setFromEuler(0, yaw, 0, 'YZX')
     })
 
-    // Groundcheck + Fahr-Logik vor jedem Step
+    // Groundcheck + Fahr-Logik
     this.world.addEventListener('preStep', () => {
       this._checkGrounded()
       this._drive()
     })
   }
 
-  /** Stabiler Ground-Check via kurzen Ray nach unten; akzeptiert jedes Objekt (Tische etc.) */
   _checkGrounded() {
-    if (!this.body || !this.world) {
-      this._isGrounded = false
-      return false
-    }
-
+    if (!this.body || !this.world) { this._isGrounded = false; return false }
     const now = performance.now()
-
-    // Ray: leicht über dem Schwerpunkt starten, bis unter die "Pfote" gehen
     const startY = this.body.position.y + this._radius * 0.2
     const endY   = this.body.position.y - (this._radius + this._groundOffset + this._rayDownExtra)
 
@@ -103,23 +226,15 @@ export default class Dog {
     const to   = new CANNON.Vec3(this.body.position.x, endY,   this.body.position.z)
 
     this._rayResult.reset()
-    this.world.raycastClosest(
-      from,
-      to,
+    this.world.raycastClosest(from, to,
       { skipBackfaces: true, collisionFilterMask: -1, checkCollisionResponse: true },
       this._rayResult
     )
 
-    if (!this._rayResult.hasHit) {
-      this._isGrounded = false
-      return false
-    }
+    if (!this._rayResult.hasHit) { this._isGrounded = false; return false }
 
-    // Normale muss "genug nach oben" zeigen (verhindert Seitenwände)
     const upDot = this._rayResult.hitNormalWorld.y
     const okSlope = upDot >= this._slopeMaxCos
-
-    // wirklich nah am Boden (nicht schräg weit weg)
     const rayLen = startY - endY
     const closeEnough = this._rayResult.distance <= (rayLen - this._groundTol)
 
@@ -128,35 +243,46 @@ export default class Dog {
     return this._isGrounded
   }
 
-  get grounded() {
-    return this._isGrounded
-  }
+  get grounded() { return this._isGrounded }
 
-  /** „Normaler“ Jump: vertikale Geschwindigkeit gezielt setzen + Coyote-Time + Cooldown */
-  jump() {
-    if (!this.body) return
+jump() {
+  if (!this.body) return
 
-    const now = performance.now()
+  const now = performance.now()
+  if (now - this._lastJumpTime < this._jumpCooldownMs) return
 
-    // Cooldown schützt vor zu schnellen Folgesprüngen
-    if (now - this._lastJumpTime < this._jumpCooldownMs) return
+  const canCoyote = (now - this._lastGroundTime) <= this._coyoteMs
+  if (this.grounded || canCoyote) {
+    // Physik
+    if (this.body.velocity.y < 0) this.body.velocity.y = 0
+    this.body.velocity.y = Math.min(this._maxVyAfterJump, this.jumpSpeed)
+    this._lastJumpTime = now
 
-    // Coyote-Time: kurz nach Verlassen des Bodens darf man noch springen
-    const canCoyote = (now - this._lastGroundTime) <= this._coyoteMs
+    // --- Animation: SOFORT zeigen (ohne Frame-Delay) ---
+    if (this._a?.jump) {
+      const J = this._a.jump
+      J.enabled = true
+      J.paused = false
+      J.reset()            // von vorn
+      J.time = 0           // sicherstellen, dass wir wirklich am Start sind
+      J.weight = 1         // sichtbar machen
 
-    if (this.grounded || canCoyote) {
-      // kleine Fallgeschwindigkeit neutralisieren
-      if (this.body.velocity.y < 0) this.body.velocity.y = 0
-      // ziel-vY setzen (keine Impulse → stabil bei kleinen Collidern)
-      this.body.velocity.y = Math.min(this._maxVyAfterJump, this.jumpSpeed)
-      this._lastJumpTime = now
+      // Locomotion sofort aus
+      if (this._a.walk) this._a.walk.weight = 0
+      if (this._a.idle) this._a.idle.weight = 0
+
+      this._jumpActive = true
+
+      // Kritisch: Mixer sofort evaluieren ⇒ keine sichtbare Verzögerung
+      if (this.mixer) this.mixer.update(0)
     }
   }
+}
 
   _drive() {
     if (!this.body) return
 
-    let dt = 1 / 60
+    let dt = 1/60
     if (this._dt && Number.isFinite(this._dt)) dt = Math.max(1/120, Math.min(1/20, this._dt))
 
     // Lenkung (nur yaw) – invertiert, damit A=links, D=rechts
@@ -192,7 +318,7 @@ export default class Dog {
     vel.x += forward.x * dv
     vel.z += forward.z * dv
 
-    // Bremsen (Shift gedrückt -> brake=1)
+    // Bremsen
     const brake = this._input.brake || 0
     if (brake > 0) {
       const drag = Math.min(0.98, 6 * dt * brake)
@@ -238,7 +364,6 @@ export default class Dog {
       if (keys.includes('w') || keys.includes('arrowup'))    throttle += +1
       if (keys.includes('s') || keys.includes('arrowdown'))  throttle += -1
 
-      // Shift = Bremsen; Space = Jump (onKeyDown)
       const brake = (keys.includes('shift')) ? 1 : 0
       this.applyInputs({ steer, throttle, brake })
     }
@@ -246,7 +371,7 @@ export default class Dog {
     window.addEventListener('keydown', (e) => {
       const k = e.key.toLowerCase()
       if (!keys.includes(k)) keys.push(k)
-      if (k === ' ') this.jump() // Space -> springen
+      if (k === ' ') this.jump()
       apply()
     })
     window.addEventListener('keyup', (e) => {

@@ -727,6 +727,8 @@ function tick() {
   if (lastCallTime) dt = t - lastCallTime
   if (dog?.setDt) dog.setDt(Math.max(1/120, Math.min(1/20, dt)))
 
+  if (dog) dog.update(dt)
+
   if (!lastCallTime) world.step(timeStep)
   else world.step(timeStep, t - lastCallTime)
   lastCallTime = t
