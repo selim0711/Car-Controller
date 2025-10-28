@@ -131,7 +131,7 @@ export class ConfettiSystem {
   }
 
   /**
-   * Aufräumen (z. B. beim Routenwechsel)
+   * Aufräumen 
    */
   dispose() {
     // aktive Partikel entfernen
